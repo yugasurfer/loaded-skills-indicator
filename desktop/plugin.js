@@ -95,34 +95,36 @@ async function fromDisplayTranscript(sid) {
   }
 }
 
-async function fetchSkills(sid) {
-  if (!sid) return emptyPayload('', false)
+async function fetchSkills(sid, storedId) {
+  // The REST route reads state.db, which is keyed by the STORED session id; the
+  // gateway's session.history RPC only resolves the in-memory RUNTIME id.
+  if (!sid && !storedId) return emptyPayload('', false)
   if (rest) {
     try {
-      return await rest('/skills?session_id=' + encodeURIComponent(sid))
+      return await rest('/skills?session_id=' + encodeURIComponent(storedId || sid))
     } catch (e) {
       /* backend not enabled / older gateway — degrade, never fail the chip */
     }
   }
   try {
-    return await fromDisplayTranscript(sid)
+    return await fromDisplayTranscript(sid || storedId)
   } catch (e) {
-    return emptyPayload(sid, true)
+    return emptyPayload(sid || storedId, true)
   }
 }
 
-function useSessionId() {
-  const runtimeId = useValue(host.state.focusedSessionId)
-  const storedId = useValue(host.state.focusedStoredSessionId)
-  return runtimeId || storedId || ''
+function useSessionIds() {
+  const runtimeId = useValue(host.state.focusedSessionId) || ''
+  const storedId = useValue(host.state.focusedStoredSessionId) || ''
+  return { runtimeId, storedId }
 }
 
 function useSkills() {
-  const sid = useSessionId()
+  const { runtimeId, storedId } = useSessionIds()
   return useQuery({
-    queryKey: [...QUERY_KEY, sid],
-    queryFn: () => fetchSkills(sid),
-    enabled: !!sid,
+    queryKey: [...QUERY_KEY, runtimeId, storedId],
+    queryFn: () => fetchSkills(runtimeId, storedId),
+    enabled: !!(runtimeId || storedId),
     refetchInterval: REFRESH_MS,
     refetchOnWindowFocus: true,
     staleTime: 1500,
