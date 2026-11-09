@@ -24,6 +24,7 @@ import {
   PALETTE_AREA,
   ROUTES_AREA,
   STATUSBAR_AREAS,
+  MessageTextContent,
   atom,
   host,
   queryClient,
@@ -32,7 +33,7 @@ import {
   useValue
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 const QUERY_KEY = ['loaded-skills']
 const PAGE_PATH = '/loaded-skills'
@@ -234,6 +235,177 @@ function insertSkillCommand(name) {
     .catch(copy)
 }
 
+/* ---------- skill body ---------- */
+
+/** The open body: { name, from, state }. Module-level so the back arrow, every
+ *  row and the palette share one selection. */
+const $bodySkill = atom(null)
+
+function openBody(name, from, state) {
+  $bodySkill.set({ name, from: from === 'all' ? 'all' : 'loaded', state: state || '' })
+}
+
+function closeBody() {
+  const entry = $bodySkill.get()
+  if (entry && entry.from) $paneView.set(entry.from)
+  $bodySkill.set(null)
+}
+
+async function fetchSkillBody(name) {
+  if (!rest) return { found: false, name, error: 'backend' }
+  // The stored id is what state.db holds; the runtime id is in memory only.
+  const sid = host.state.focusedStoredSessionId.get() || host.state.focusedSessionId.get() || ''
+  try {
+    return await rest('/body?name=' + encodeURIComponent(name) + '&session_id=' + encodeURIComponent(sid))
+  } catch (e) {
+    return { found: false, name, error: 'backend' }
+  }
+}
+
+function clockOf(seconds) {
+  if (!seconds) return ''
+  try {
+    return new Date(seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  } catch (e) {
+    return ''
+  }
+}
+
+/** What the header is allowed to claim: the file on disk, and how it relates
+ *  to the copy this conversation read. */
+function provenanceOf(skill) {
+  if (!skill || !skill.found) return ''
+  if (!skill.read_at) return 'On disk now \u00b7 this conversation has not read it'
+  const read = 'read here at ' + clockOf(skill.read_at)
+  return skill.modified_since_read
+    ? 'On disk now \u00b7 ' + read + ' \u00b7 file modified at ' + clockOf(skill.modified_at)
+    : 'On disk now \u00b7 ' + read + ' \u00b7 unchanged since'
+}
+
+const BODY_LABEL = {
+  fontVariantNumeric: 'tabular-nums',
+  fontSize: 10,
+  letterSpacing: '0.04em',
+  textTransform: 'uppercase',
+  color: 'var(--ui-text-quaternary)'
+}
+
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+
+/** One skill's text: the trigger line first, the document, then the rest of
+ *  the frontmatter as plain text and one honest provenance line. */
+function SkillBody({ entry }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: [...QUERY_KEY, 'body', entry.name],
+    queryFn: () => fetchSkillBody(entry.name),
+    staleTime: 0,
+    refetchOnMount: 'always',
+    retry: 1
+  })
+
+  const skill = data || {}
+  const found = Boolean(skill.found)
+  const pruned = entry.state === 'pruned'
+  const size = skill.bytes ? Math.round(skill.bytes / 102.4) / 10 + ' kB' : ''
+
+  let note = null
+  if (skill.error === 'backend') note = 'The text view needs the plugin backend, which is off for this profile.'
+  else if (isError) note = 'Could not read this skill.'
+  else if (isLoading && !data) note = 'Reading the skill\u2026'
+  else if (data && !found) note = 'This skill is not on disk where the plugin can read it.'
+
+  const parts = []
+  if (skill.trigger) {
+    parts.push(jsxs('div', {
+      key: 'trigger',
+      style: { borderLeft: '2px solid var(--ui-accent)', padding: '2px 0 2px 8px', display: 'flex', flexDirection: 'column', gap: 2 },
+      children: [
+        jsx('span', { key: 'l', style: BODY_LABEL, children: 'trigger \u00b7 description' }),
+        jsx('span', { key: 'v', style: { fontSize: 12, lineHeight: 1.45 }, children: skill.trigger })
+      ]
+    }))
+  }
+  if (found) {
+    parts.push(jsx('div', { key: 'doc', style: { fontSize: 12, lineHeight: 1.55 }, children: jsx(MessageTextContent, { text: skill.body || '', media: false }) }))
+  }
+  if (skill.truncated) {
+    parts.push(jsx('div', { key: 'cut', style: { fontSize: 10.5, color: 'var(--ui-text-quaternary)' }, children: 'This file is larger than the panel reads; the end is cut off.' }))
+  }
+  if (skill.frontmatter_raw) {
+    parts.push(jsxs('details', {
+      key: 'fm',
+      children: [
+        jsx('summary', { key: 's', style: { ...BODY_LABEL, cursor: 'pointer' }, children: 'rest of the frontmatter' }),
+        jsx('pre', {
+          key: 'p',
+          style: {
+            margin: '6px 0 0',
+            padding: 8,
+            fontSize: 10.5,
+            lineHeight: 1.4,
+            fontFamily: MONO,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+            border: '1px solid var(--ui-stroke-secondary)',
+            borderRadius: 6,
+            color: 'var(--ui-text-quaternary)'
+          },
+          children: skill.frontmatter_raw
+        })
+      ]
+    }))
+  }
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+    children: [
+      jsxs('div', {
+        key: 'head',
+        style: { display: 'flex', alignItems: 'center', gap: 8, padding: '0 0 8px', flex: '0 0 auto' },
+        children: [
+          jsx('button', {
+            key: 'back',
+            type: 'button',
+            onClick: closeBody,
+            title: 'Back to the list',
+            'aria-label': 'Back to the list',
+            style: {
+              border: '1px solid var(--ui-stroke-secondary)',
+              background: 'transparent',
+              color: 'inherit',
+              borderRadius: 6,
+              cursor: 'pointer',
+              fontSize: 11,
+              lineHeight: 1,
+              padding: '4px 7px',
+              flex: '0 0 auto'
+            },
+            children: '\u2190'
+          }),
+          jsxs('div', { key: 't', style: { minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }, children: [
+            jsx('span', { key: 'n', style: { fontSize: 12.5, fontWeight: 650, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: entry.name }),
+            jsx('span', {
+              key: 's',
+              style: { fontSize: 10, color: 'var(--ui-text-quaternary)' },
+              children: (pruned ? 'pruned \u2014 the agent no longer holds this text' : 'in context') + (size ? ' \u00b7 ' + size : '')
+            })
+          ] })
+        ]
+      }),
+      jsx('div', {
+        key: 'scroll',
+        style: { flex: '1 1 auto', minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10 },
+        children: note
+          ? jsx('div', { key: 'note', style: { fontSize: 11.5, color: 'var(--ui-text-quaternary)', padding: '6px 0' }, children: note })
+          : parts
+      }),
+      found
+        ? jsx('div', { key: 'prov', style: { flex: '0 0 auto', paddingTop: 8, fontSize: 10, color: 'var(--ui-text-quaternary)' }, children: provenanceOf(skill) })
+        : null
+    ]
+  })
+}
+
 /* ---------- shared bits ---------- */
 
 
@@ -247,36 +419,38 @@ const DOT = full => ({
   opacity: full ? 1 : 0.8
 })
 
-function SkillRow({ skill }) {
+function SkillRow({ skill, onOpen }) {
   const full = skill.state === 'full'
-  return jsxs('div', {
-    style: {
-      display: 'flex',
-      alignItems: 'center',
-      gap: 8,
-      minHeight: 26,
-      padding: '4px 12px'
-    },
-    children: [
-      jsx('span', { key: 'dot', style: DOT(full), title: full ? 'content in context' : 'pruned by compression' }),
-      jsx('span', {
-        key: 'name',
-        style: {
-          flex: '1 1 auto',
-          minWidth: 0,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          fontSize: 12,
-          fontWeight: full ? 620 : 400,
-          color: full ? 'inherit' : 'var(--ui-text-quaternary)'
-        },
-        children: skill.name
-      }),
-      full
-        ? jsx('span', { key: 'tag', style: { fontSize: 10, color: 'var(--ui-text-quaternary)' }, children: 'in context' })
-        : jsx('span', { key: 'tag', style: { fontSize: 10, color: 'var(--ui-text-quaternary)', letterSpacing: '0.02em' }, children: 'pruned' })
-    ]
+  const kids = [
+    jsx('span', { key: 'dot', style: DOT(full), title: full ? 'content in context' : 'pruned by compression' }),
+    jsx('span', {
+      key: 'name',
+      style: {
+        flex: '1 1 auto',
+        minWidth: 0,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        fontSize: 12,
+        fontWeight: full ? 620 : 400,
+        color: full ? 'inherit' : 'var(--ui-text-quaternary)'
+      },
+      children: skill.name
+    }),
+    full
+      ? jsx('span', { key: 'tag', style: { fontSize: 10, color: 'var(--ui-text-quaternary)' }, children: 'in context' })
+      : jsx('span', { key: 'tag', style: { fontSize: 10, color: 'var(--ui-text-quaternary)', letterSpacing: '0.02em' }, children: 'pruned' })
+  ]
+  const base = { display: 'flex', alignItems: 'center', gap: 8, minHeight: 26, padding: '4px 12px', width: '100%', boxSizing: 'border-box', textAlign: 'left' }
+  if (!onOpen) return jsxs('div', { style: base, children: kids })
+  return jsxs('button', {
+    type: 'button',
+    onClick: () => onOpen(skill.name),
+    onMouseEnter: e => { e.currentTarget.style.background = 'rgba(127,127,127,0.10)' },
+    onMouseLeave: e => { e.currentTarget.style.background = 'transparent' },
+    title: 'Read ' + skill.name + ' — the whole SKILL.md, no turn spent',
+    style: { ...base, border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer' },
+    children: kids
   })
 }
 
@@ -368,6 +542,12 @@ function SkillsPanel({ onClose }) {
   const full = skills.filter(s => s.state === 'full')
   const pruned = skills.filter(s => s.state === 'pruned')
 
+  const openFromPopover = (name, state) => {
+    if (onClose) onClose()
+    openBody(name, 'loaded', state)
+    openSkillsPane('loaded')
+  }
+
   const body = []
   if (isLoading && !data) {
     body.push(jsx('div', { key: 'load', style: { padding: '8px 12px', fontSize: 11, opacity: 0.7 }, children: 'Reading transcript…' }))
@@ -385,13 +565,13 @@ function SkillsPanel({ onClose }) {
       body.push(
         jsx('div', { key: 'fh', style: { padding: '6px 12px 2px', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ui-text-quaternary)' }, children: 'In context · ' + full.length })
       )
-      full.forEach(s => body.push(jsx(SkillRow, { skill: s }, 'f-' + s.name)))
+      full.forEach(s => body.push(jsx(SkillRow, { skill: s, onOpen: () => openFromPopover(s.name, s.state) }, 'f-' + s.name)))
     }
     if (pruned.length) {
       body.push(
         jsx('div', { key: 'ph', style: { padding: '8px 12px 2px', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ui-text-quaternary)' }, children: 'Pruned · ' + pruned.length })
       )
-      pruned.forEach(s => body.push(jsx(SkillRow, { skill: s }, 'p-' + s.name)))
+      pruned.forEach(s => body.push(jsx(SkillRow, { skill: s, onOpen: () => openFromPopover(s.name, s.state) }, 'p-' + s.name)))
     }
   }
 
@@ -521,76 +701,108 @@ function ViewSwitch({ view }) {
   return jsx('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 3 }, children: kids })
 }
 
-/** One row in "All skills": name, description, and whether it is already in
- *  context. Clicking drops `/name` into the composer — never submits it. */
-function AvailableRow({ skill, state }) {
+/** One row in "All skills": two real buttons, never one inside the other.
+ *  The row puts `/name` in the composer (never submits); `read` opens the text. */
+function AvailableRow({ skill, state, onOpen }) {
   const full = state === 'full'
   const pruned = state === 'pruned'
-  return jsxs('button', {
-    type: 'button',
-    onClick: () => insertSkillCommand(skill.name),
-    title: skill.description ? skill.description + '\n\nClick to put /' + skill.name + ' in the composer' : 'Click to put /' + skill.name + ' in the composer',
-    style: {
-      display: 'flex',
-      alignItems: 'baseline',
-      gap: 8,
-      width: '100%',
-      textAlign: 'left',
-      border: 'none',
-      background: 'transparent',
-      color: 'inherit',
-      cursor: 'pointer',
-      padding: '4px 12px',
-      minHeight: 24
-    },
+  const loadTitle = skill.description
+    ? skill.description + '\n\nClick to put /' + skill.name + ' in the composer'
+    : 'Click to put /' + skill.name + ' in the composer'
+  return jsxs('div', {
+    style: { display: 'flex', alignItems: 'center', width: '100%', gap: 2 },
     children: [
-      jsx('span', {
-        key: 'dot',
+      jsxs('button', {
+        key: 'load',
+        type: 'button',
+        onClick: () => insertSkillCommand(skill.name),
+        title: loadTitle,
         style: {
-          width: 5,
-          height: 5,
-          borderRadius: 999,
-          flex: '0 0 auto',
-          alignSelf: 'center',
-          background: full ? 'var(--ui-accent)' : 'transparent',
-          border: full ? 'none' : pruned ? '1px solid var(--ui-text-quaternary)' : '1px solid var(--ui-stroke-secondary)',
-          opacity: pruned ? 0.8 : 1
-        }
-      }),
-      jsxs('span', { key: 'body', style: { minWidth: 0, flex: '1 1 auto', display: 'flex', flexDirection: 'column' }, children: [
-        jsx('span', {
-          key: 'n',
-          style: {
-            fontSize: 12,
-            fontWeight: full ? 620 : 400,
-            color: pruned ? 'var(--ui-text-quaternary)' : 'inherit',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap'
-          },
-          children: skill.name
-        }),
-        skill.description
-          ? jsx('span', {
-              key: 'd',
+          display: 'flex',
+          alignItems: 'baseline',
+          gap: 8,
+          flex: '1 1 auto',
+          minWidth: 0,
+          textAlign: 'left',
+          border: 'none',
+          background: 'transparent',
+          color: 'inherit',
+          cursor: 'pointer',
+          padding: '4px 4px 4px 12px',
+          minHeight: 24
+        },
+        children: [
+          jsx('span', {
+            key: 'dot',
+            style: {
+              width: 5,
+              height: 5,
+              borderRadius: 999,
+              flex: '0 0 auto',
+              alignSelf: 'center',
+              background: full ? 'var(--ui-accent)' : 'transparent',
+              border: full ? 'none' : pruned ? '1px solid var(--ui-text-quaternary)' : '1px solid var(--ui-stroke-secondary)',
+              opacity: pruned ? 0.8 : 1
+            }
+          }),
+          jsxs('span', { key: 'body', style: { minWidth: 0, flex: '1 1 auto', display: 'flex', flexDirection: 'column' }, children: [
+            jsx('span', {
+              key: 'n',
               style: {
-                fontSize: 10.5,
-                lineHeight: 1.35,
-                color: 'var(--ui-text-quaternary)',
+                fontSize: 12,
+                fontWeight: full ? 620 : 400,
+                color: pruned ? 'var(--ui-text-quaternary)' : 'inherit',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap'
               },
-              children: skill.description
-            })
-          : null
-      ] }),
-      jsx('span', {
-        key: 'tag',
-        style: { flex: '0 0 auto', fontSize: 10, color: 'var(--ui-text-quaternary)', alignSelf: 'center' },
-        children: full ? 'in context' : pruned ? 'pruned' : '+'
-      })
-    ].filter(Boolean)
+              children: skill.name
+            }),
+            skill.description
+              ? jsx('span', {
+                  key: 'd',
+                  style: {
+                    fontSize: 10.5,
+                    lineHeight: 1.35,
+                    color: 'var(--ui-text-quaternary)',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap'
+                  },
+                  children: skill.description
+                })
+              : null
+          ] }),
+          jsx('span', {
+            key: 'tag',
+            style: { flex: '0 0 auto', fontSize: 10, color: 'var(--ui-text-quaternary)', alignSelf: 'center' },
+            children: full ? 'in context' : pruned ? 'pruned' : '+'
+          })
+        ]
+      }),
+      onOpen
+        ? jsx('button', {
+            key: 'read',
+            type: 'button',
+            onClick: onOpen,
+            title: 'Read ' + skill.name,
+            'aria-label': 'Read the body of ' + skill.name,
+            style: {
+              flex: '0 0 auto',
+              alignSelf: 'stretch',
+              border: 'none',
+              background: 'transparent',
+              color: 'var(--ui-text-quaternary)',
+              cursor: 'pointer',
+              fontSize: 10,
+              padding: '0 10px',
+              textDecoration: 'underline',
+              textUnderlineOffset: 2
+            },
+            children: 'read'
+          })
+        : null
+    ]
   })
 }
 
@@ -598,9 +810,22 @@ function AvailableRow({ skill, state }) {
  *  inventory you can load from. Same docked column, one switch. */
 function SkillsPane() {
   const view = useValue($paneView)
+  const bodySkill = useValue($bodySkill)
+  const sid = useSessionId()
+  const lastSid = useRef(sid)
   const loadedQuery = useSkills()
   const availableQuery = useAvailableSkills()
   const [filter, setFilter] = useState('')
+
+  // A body belongs to the conversation that opened it — reset when the
+  // conversation CHANGES. Not on mount: the chip's popover sets the body
+  // before this pane exists, and a mount-time reset would throw it away.
+  useEffect(() => {
+    if (lastSid.current !== sid) {
+      lastSid.current = sid
+      $bodySkill.set(null)
+    }
+  }, [sid])
 
   const loaded = loadedQuery.data && Array.isArray(loadedQuery.data.skills) ? loadedQuery.data.skills : []
   const loadedState = useMemo(() => {
@@ -634,6 +859,8 @@ function SkillsPane() {
     return out
   }, [shownAvailable])
 
+  if (bodySkill) return jsx(SkillBody, { entry: bodySkill })
+
   const isLoading = view === 'loaded' ? loadedQuery.isLoading && !loadedQuery.data : availableQuery.isLoading && !availableQuery.data
   const isError = view === 'loaded' ? loadedQuery.isError : availableQuery.isError
 
@@ -646,7 +873,7 @@ function SkillsPane() {
     if (!shownLoaded.length) {
       body.push(jsx('div', { key: 'empty', style: { padding: '8px 12px', fontSize: 11.5, color: 'var(--ui-text-quaternary)' }, children: loaded.length ? 'No skill matches that filter.' : 'No skills have been read into this conversation.' }))
     } else {
-      for (const s of shownLoaded) body.push(jsx(SkillRow, { skill: s }, 'l-' + s.name))
+      for (const s of shownLoaded) body.push(jsx(SkillRow, { skill: s, onOpen: () => openBody(s.name, 'loaded', s.state) }, 'l-' + s.name))
     }
   } else if (!shownAvailable.length) {
     body.push(jsx('div', { key: 'empty', style: { padding: '8px 12px', fontSize: 11.5, color: 'var(--ui-text-quaternary)' }, children: available.length ? 'No skill matches that filter.' : 'No skills found on disk.' }))
@@ -659,7 +886,7 @@ function SkillsPane() {
           children: group.category
         })
       )
-      for (const s of group.items) body.push(jsx(AvailableRow, { skill: s, state: loadedState[s.name] || '' }, 'a-' + s.name))
+      for (const s of group.items) body.push(jsx(AvailableRow, { skill: s, state: loadedState[s.name] || '', onOpen: () => openBody(s.name, 'all', loadedState[s.name] || '') }, 'a-' + s.name))
     }
   }
 

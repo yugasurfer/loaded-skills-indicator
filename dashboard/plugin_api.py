@@ -165,35 +165,49 @@ def _tool_call_skills(row: sqlite3.Row) -> list[tuple[str, str]]:
     return out
 
 
-def _tool_row_state(content: Any) -> str:
-    """FULL / PRUNED / "" (nothing was read) for one skill_view tool result."""
+def _tool_row(content: Any) -> tuple[str, str]:
+    """``(FULL|PRUNED|"", skill_dir)`` for one skill_view tool result.
+
+    ``skill_dir`` is the directory the body was read from, when the result
+    carries one — linked-file reads and prune markers do not.
+    """
     if not isinstance(content, str) or not content.strip():
-        return ""
+        return "", ""
     if "[SKILL_PRUNED" in content:
-        return PRUNED
+        return PRUNED, ""
     payload = _json(content)
     if isinstance(payload, dict):
         if payload.get("success") is False or payload.get("error"):
-            return ""
-        return FULL
+            return "", ""
+        return FULL, str(payload.get("skill_dir") or "").strip()
     head = content.lstrip().split("\n", 1)[0]
     if head.startswith("[skill_view]") and "FAILED" in head:
-        return ""
-    return FULL
+        return "", ""
+    return FULL, ""
 
 
 def analyse(rows: list[sqlite3.Row]) -> list[dict]:
-    """Ordered, deduped skill states; the LAST event for a name wins."""
+    """Ordered, deduped skill states; the LAST event for a name wins.
+
+    Two facts ride along for the body view: ``dir`` (the directory a read came
+    from, when the result carried one) and ``read_at`` (the time of the last
+    event that actually put the body in front of the model — a compression
+    prune updates ``state``/``last_at`` but must never move ``read_at``).
+    """
     order: list[str] = []
     state: dict[str, dict] = {}
     call_names: dict[str, str] = {}
 
-    def note(name: str, kind: str, ts: Any, origin: str) -> None:
+    def note(name: str, kind: str, ts: Any, origin: str, where: str = "") -> None:
         if name not in state:
             order.append(name)
-            state[name] = {"name": name, "state": kind, "last_at": ts, "origin": origin}
+            state[name] = {"name": name, "state": kind, "last_at": ts, "origin": origin, "dir": "", "read_at": None}
         else:
             state[name].update(state=kind, last_at=ts, origin=origin)
+        if where:
+            state[name]["dir"] = where
+        if kind == FULL:
+            state[name]["read_at"] = ts
 
     for row in rows:
         role = row["role"]
@@ -208,11 +222,11 @@ def analyse(rows: list[sqlite3.Row]) -> list[dict]:
             name = call_names.get(str(row["tool_call_id"] or ""), "")
             if tool_name not in SKILL_TOOL_NAMES and not name:
                 continue
-            kind = _tool_row_state(content)
+            kind, where = _tool_row(content)
             if not kind:
                 continue
             if name:
-                note(name, kind, ts, "skill_view")
+                note(name, kind, ts, "skill_view", where)
                 continue
             for found in _PRUNED_RE.findall(content if isinstance(content, str) else ""):
                 note(found, PRUNED, ts, "compaction")
@@ -276,7 +290,10 @@ _MAX_SKILL_FILES = 5000
 
 def _skill_roots() -> list[Path]:
     """Directories that hold SKILL.md files: this profile's, then the default
-    root's, plus the bundled and optional sets shipped with the checkout."""
+    root's, plus the bundled and optional sets shipped with the checkout, plus
+    the skill packs that installed plugins ship (``plugins/**/SKILL.md``). On a
+    full install those packs are the bulk of the tree, and they were invisible
+    to the list and the body route before."""
     homes = [_hermes_home()]
     try:
         from hermes_constants import get_default_hermes_root
@@ -291,6 +308,7 @@ def _skill_roots() -> list[Path]:
             home / "skills",
             home / "hermes-agent" / "skills",
             home / "hermes-agent" / "optional-skills",
+            home / "plugins",
         ]
     return [p for p in dict.fromkeys(candidates) if p.is_dir()]
 
@@ -415,3 +433,125 @@ def available() -> dict:
     with _lock:
         _available_cache[key] = (now, result)
     return result
+
+
+# ------------------------------------------------------------ skill body ----
+
+_MAX_BODY_BYTES = 400_000  # one SKILL.md is a few KB; this is a runaway guard
+
+
+def split_frontmatter(text: str) -> tuple[str, str]:
+    """``(frontmatter block, body)`` — the block without its fence lines.
+
+    No frontmatter, or one this parser cannot see, returns ``("", text)``: the
+    whole file is the body and the caller shows no trigger box.
+    """
+    match = _FM_BLOCK_RE.match(text)
+    if not match:
+        return "", text
+    body = text[match.end():]
+    body = body.lstrip(chr(13) + chr(10))  # the blank line after the fence is not content
+    return match.group(1), body
+
+
+def trigger_from_block(block: str) -> str:
+    """The ``description`` out of a frontmatter block, folded if it is a block."""
+    match = _FM_DESC_RE.search(block or "")
+    if not match:
+        return ""
+    raw = match.group(1).strip()
+    if raw in ("|", ">", "|-", ">-", "|+", ">+"):
+        lines = []
+        for line in block[match.end():].split("\n"):
+            if line.strip() and line[:1] not in (" ", "\t"):
+                break
+            lines.append(line.strip())
+        return " ".join(l for l in lines if l)
+    return _unquote(raw)
+
+
+def _recorded_read(name: str, session_id: str) -> tuple[str, Any]:
+    """``(skill directory, read time)`` this session recorded for a skill."""
+    if not (session_id or "").strip():
+        return "", None
+    try:
+        entries = skills(session_id).get("skills", [])
+    except Exception:
+        return "", None
+    for entry in entries:
+        if entry.get("name") == name:
+            return str(entry.get("dir") or ""), entry.get("read_at")
+    return "", None
+
+
+@router.get("/body")
+def body(
+    name: str = Query("", description="Skill name"),
+    session_id: str = Query("", description="Runtime or stored session id"),
+) -> dict:
+    """One skill's text, split from its frontmatter, with where it came from.
+
+    Resolution order: the directory this conversation recorded for that read,
+    then the disk scan. The name is the only selector — a path from the client
+    is never honoured. No cache: an edited skill must show its new text on the
+    next click.
+    """
+    key = (name or "").strip()
+    result = {
+        "found": False,
+        "name": key,
+        "path": "",
+        "body": "",
+        "trigger": "",
+        "frontmatter_raw": "",
+        "bytes": 0,
+        "truncated": False,
+        "modified_at": None,
+        "read_at": None,
+        "modified_since_read": None,
+        "reason": "unknown_name",
+    }
+    if not key:
+        return result
+
+    recorded_dir, read_at = _recorded_read(key, session_id or "")
+    path = None
+    if recorded_dir:
+        candidate = Path(recorded_dir) / "SKILL.md"
+        if candidate.is_file():
+            path = candidate
+    if path is None:
+        for entry in available().get("skills", []):
+            if entry["name"] == key:
+                path = Path(entry["path"])
+                break
+    if path is None:
+        return result
+
+    try:
+        raw = path.read_bytes()
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {**result, "reason": "unreadable", "path": str(path)}
+    if not raw.strip():
+        return {**result, "reason": "empty", "path": str(path)}
+
+    text = raw[:_MAX_BODY_BYTES].decode("utf-8", "replace")
+    frontmatter_raw, body_text = split_frontmatter(text)
+    modified = None
+    if isinstance(read_at, (int, float)) and read_at:
+        modified = mtime > float(read_at)
+    return {
+        "found": True,
+        "name": key,
+        "path": str(path),
+        "body": body_text,
+        "trigger": trigger_from_block(frontmatter_raw),
+        "frontmatter_raw": frontmatter_raw,
+        "bytes": len(raw),
+        "truncated": len(raw) > _MAX_BODY_BYTES,
+        "modified_at": mtime,
+        "read_at": read_at if isinstance(read_at, (int, float)) else None,
+        "modified_since_read": modified,
+        "reason": "ok",
+    }

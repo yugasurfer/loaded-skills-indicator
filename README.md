@@ -86,14 +86,33 @@ What this plugin touches, for anyone deciding whether to install it:
    session to decide which skills are still in context. No writes, no other
    tables.
 2. **Reads skill files.** The "available" view asks `GET /available`, which reads
-   `SKILL.md` frontmatter (name, description, category) under the profile and
-   bundled skills directories — nothing else on disk.
+   `SKILL.md` frontmatter (name, description, category) under the profile, the
+   bundled skill folders and the skill packs shipped by installed plugins.
+   Opening a skill's body reads that one whole file (`GET /body`), on request,
+   and never writes it. Nothing else on disk is read.
 3. **Types into your composer.** Clicking an available skill calls
    `host.composer.insertText` with `/<skill> `; it never submits. If that surface
    is missing the command is copied to the clipboard (`ctx.os.writeClipboard`).
 
 No network calls, no telemetry, no credentials, no subprocesses, no self-update
 machinery. The plugin never mutates a session, a skill or a config file.
+
+## Reading a skill's text
+
+Click a name — in the chip's popover or in the panel's list — and the panel shows
+that skill's text, read-only. The `description` line sits in its own box at the
+top because it is the line that decides whether the agent picks the skill up;
+the rest of the file renders as a document, with the other frontmatter keys
+available underneath.
+
+One line at the bottom says what you are looking at: the file on disk, whether
+this conversation still holds it (*in context*) or dropped it in compression
+(*pruned*), and whether the file was modified after the read — both times shown
+when they differ. It compares timestamps, so it reports *modified*, never *what
+changed*: a re-save of identical text also moves that line.
+
+In the `available` list, the row still puts `/skill` in the composer; the small
+`read` to its right opens the text instead.
 
 ## Why a backend
 

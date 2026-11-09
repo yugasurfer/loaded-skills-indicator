@@ -1,4 +1,4 @@
 name: loaded-skills-indicator
-version: "1.0.0"
+version: "1.1.0"
 requires_hermes: ">=0.22.5"
-description: Status-bar chip, popover and dockable pane showing which skills are loaded into the active conversation's context, plus the full library with click-to-load.
+description: Status-bar chip, popover and dockable pane showing which skills are loaded into the active conversation's context, plus the full library with click-to-load and one click from a name to its text.
