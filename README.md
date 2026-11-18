@@ -4,7 +4,10 @@ A Hermes Desktop status-bar chip that answers one question:
 
 > **Which skills are read into this conversation's context right now?**
 
-`Skills: 6 loaded` in the bottom-right cluster. Click it for the list:
+`Skills: ●6 ○2` in the bottom-right cluster: a filled dot for the skills still
+in context, a hollow dot for the ones compression pruned. The words live in the
+hover tooltip (`6 skills loaded`, `2 skills pruned by compression`) so the chip
+spends its width on the counts. Click it for the list:
 
 ![The chip popover listing loaded skills](media/popover.png)
 
@@ -135,7 +138,7 @@ transcript only"*.
   the focused session changes, and when the window regains focus.
 - Follows the focused chat (`host.state.focusedSessionId` /
   `focusedStoredSessionId`), including session tiles.
-- Zero skills → `Skills: 0 loaded`, and the popover says nothing is loaded.
+- Zero skills → a filled dot and `0`, and the popover says nothing is loaded.
 - Right-click the status bar to hide the chip (it is listed as **Loaded
   skills**); the ⌘K pane keeps working either way.
 - A gateway caches a mounted plugin router, so after a plugin *update* a new

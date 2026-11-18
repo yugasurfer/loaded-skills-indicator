@@ -328,20 +328,72 @@ function RefreshButton({ onDone }) {
 
 /* ---------- status bar chip ---------- */
 
+/** 10px dot pair — the same vocabulary the popover rows already use: filled
+ *  while the body is in context, stuck through once compression pruned it
+ *  (a struck ring, so a count beside it cannot read as a letter O). */
+function Glyph({ kind }) {
+  const full = kind === 'full'
+  return jsx('svg', {
+    viewBox: '0 0 10 10',
+    width: 10,
+    height: 10,
+    'aria-hidden': 'true',
+    focusable: 'false',
+    style: { display: 'block', flex: '0 0 auto' },
+    children: full
+      ? jsx('circle', { cx: 5, cy: 5, r: 3.4, fill: 'var(--ui-accent)' })
+      : jsxs('g', {
+          children: [
+            jsx('circle', { cx: 5, cy: 5, r: 3.1, fill: 'none', stroke: 'currentColor', strokeWidth: 1.1 }),
+            jsx('line', { x1: 2.9, y1: 2.9, x2: 7.1, y2: 7.1, stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round' })
+          ]
+        })
+  })
+}
+
+/** Visually hidden, still announced: the chip keeps its words for a screen
+ *  reader even though the status bar only has room for the counts. */
+const SR_ONLY = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  margin: -1,
+  padding: 0,
+  overflow: 'hidden',
+  clip: 'rect(0 0 0 0)',
+  whiteSpace: 'nowrap',
+  border: 0
+}
+
+/** `● 6 ⊘ 2` — the numbers stay, the labels become glyphs. Each group carries
+ *  its words in a tooltip, and the pair carries them once for assistive tech. */
+function ChipCounts({ count, pruned }) {
+  const group = (kind, n, label) =>
+    jsxs('span', {
+      key: kind,
+      title: label,
+      style: { display: 'inline-flex', alignItems: 'center', gap: 5 },
+      children: [
+        jsx(Glyph, { key: 'g', kind }),
+        jsx('span', { key: 'n', style: { fontVariantNumeric: 'tabular-nums' }, children: String(n) })
+      ]
+    })
+  const kids = [group('full', count, count + (count === 1 ? ' skill loaded' : ' skills loaded'))]
+  if (pruned > 0) {
+    kids.push(group('pruned', pruned, pruned + (pruned === 1 ? ' skill pruned by compression' : ' skills pruned by compression')))
+  }
+  kids.push(jsx('span', { key: 'sr', style: SR_ONLY, children: count + ' loaded, ' + pruned + ' pruned' }))
+  return jsx('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 7 }, children: kids })
+}
+
 function ChipDetail() {
   const { data, isError, isLoading } = useSkills()
   if (!data) {
-    return jsx('span', { style: { opacity: 0.6 }, children: isLoading ? '…' : isError ? '?' : '0 loaded' })
+    if (isLoading) return jsx('span', { style: { opacity: 0.6 }, children: '…' })
+    if (isError) return jsx('span', { style: { opacity: 0.6 }, children: '?' })
+    return jsx(ChipCounts, { count: 0, pruned: 0 })
   }
-  const pruned = Array.isArray(data.pruned) ? data.pruned.length : 0
-  const kids = [
-    jsx('span', { key: 'n', style: { fontVariantNumeric: 'tabular-nums' }, children: String(data.count) }),
-    jsx('span', { key: 'l', children: ' loaded' })
-  ]
-  if (pruned > 0) {
-    kids.push(jsx('span', { key: 'p', style: { opacity: 0.7 }, children: ' · ' + pruned + ' pruned' }))
-  }
-  return jsxs('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 0 }, children: kids })
+  return jsx(ChipCounts, { count: data.count, pruned: Array.isArray(data.pruned) ? data.pruned.length : 0 })
 }
 
 function ChipIcon() {
@@ -361,6 +413,18 @@ function ChipIcon() {
 }
 
 /* ---------- popover ---------- */
+
+/** Popover section header: the chip's glyph, then the label and count it
+ *  explains, so `● In context · 6` reads without a hover. */
+function GroupHeader({ kind, label, count, pad }) {
+  return jsxs('div', {
+    style: { display: 'flex', alignItems: 'center', gap: 5, padding: pad, fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ui-text-quaternary)' },
+    children: [
+      jsx(Glyph, { key: 'g', kind }),
+      jsx('span', { key: 't', style: { fontVariantNumeric: 'tabular-nums' }, children: label + ' · ' + count })
+    ]
+  })
+}
 
 function SkillsPanel({ onClose }) {
   const { data, isError, isLoading } = useSkills()
@@ -383,13 +447,13 @@ function SkillsPanel({ onClose }) {
   } else {
     if (full.length) {
       body.push(
-        jsx('div', { key: 'fh', style: { padding: '6px 12px 2px', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ui-text-quaternary)' }, children: 'In context · ' + full.length })
+        jsx(GroupHeader, { key: 'fh', kind: 'full', label: 'In context', count: full.length, pad: '6px 12px 2px' })
       )
       full.forEach(s => body.push(jsx(SkillRow, { skill: s }, 'f-' + s.name)))
     }
     if (pruned.length) {
       body.push(
-        jsx('div', { key: 'ph', style: { padding: '8px 12px 2px', fontSize: 10, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--ui-text-quaternary)' }, children: 'Pruned · ' + pruned.length })
+        jsx(GroupHeader, { key: 'ph', kind: 'pruned', label: 'Pruned', count: pruned.length, pad: '8px 12px 2px' })
       )
       pruned.forEach(s => body.push(jsx(SkillRow, { skill: s }, 'p-' + s.name)))
     }
