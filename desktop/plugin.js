@@ -10,11 +10,10 @@
  *   • anything never loaded in this conversation is not listed at all
  *
  * Data: this plugin's own backend namespace (`/api/plugins/loaded-skills-indicator/skills`),
- * because the gateway's `session.history` RPC strips tool-result bodies. If
- * that backend is unavailable (plugin not enabled in this profile), the plugin
- * degrades to the display transcript: skill_view invocations are still listed
- * and pruned markers are still read, but a body whose marker the summarizer
- * dropped cannot be told apart — the panel says so explicitly.
+ * because the gateway's `session.history` RPC strips tool-result bodies.
+ * The HTTP read is keyed by the persisted id paired with the focused session's
+ * exact owner (connection + profile). If that identity is unavailable or not
+ * yet persisted, the UI says so and never reports a zero count.
  *
  * The chip is a DATA contribution (`variant: 'menu'`), so it gets the app's
  * real status-bar chrome and popover shell. A ⌘K command opens the same list
@@ -46,83 +45,89 @@ let writeClipboard = null
 
 /* ---------- data ---------- */
 
-const PRUNE_RE = /\[SKILL_PRUNED:[^\]]*?skill_view\(name='([^']+)'\)/g
-
-function emptyPayload(sid, degraded) {
-  return { session_id: sid, count: 0, skills: [], loaded: [], pruned: [], generated_at: Date.now() / 1000, degraded: !!degraded }
-}
-
-/** Renderer-only fallback: the display transcript (no tool bodies, markers intact). */
-async function fromDisplayTranscript(sid) {
-  const res = await host.request('session.history', { session_id: sid })
-  const messages = (res && res.messages) || []
-  const order = []
-  const byName = new Map()
-  const note = (name, state, ts) => {
-    if (!name) return
-    const row = byName.get(name)
-    if (!row) {
-      order.push(name)
-      byName.set(name, { name, state, last_at: ts, origin: state === 'full' ? 'skill_view' : 'compaction' })
-      return
-    }
-    row.state = state
-    row.last_at = ts
-    row.origin = state === 'full' ? 'skill_view' : 'compaction'
-  }
-  for (const m of messages) {
-    if (!m || typeof m !== 'object') continue
-    if (m.role === 'tool' && m.name === 'skill_view' && m.args && m.args.name) {
-      note(String(m.args.name), 'full', m.timestamp)
-      continue
-    }
-    const text = typeof m.text === 'string' ? m.text : typeof m.content === 'string' ? m.content : ''
-    if (!text || text.indexOf('[SKILL_PRUNED') < 0) continue
-    PRUNE_RE.lastIndex = 0
-    let hit
-    while ((hit = PRUNE_RE.exec(text)) !== null) note(hit[1], 'pruned', m.timestamp)
-  }
-  const skills = order.map(n => byName.get(n))
+function unavailablePayload(storedId, reason) {
   return {
-    session_id: sid,
-    count: skills.filter(s => s.state === 'full').length,
-    skills,
-    loaded: skills.filter(s => s.state === 'full').map(s => s.name),
-    pruned: skills.filter(s => s.state === 'pruned').map(s => s.name),
+    session_id: storedId || '',
+    count: null,
+    skills: [],
+    loaded: [],
+    pruned: [],
     generated_at: Date.now() / 1000,
-    degraded: true,
-    source: 'display-transcript'
+    degraded: false,
+    unavailable: true,
+    reason
   }
 }
 
-async function fetchSkills(sid) {
-  if (!sid) return emptyPayload('', false)
-  if (rest) {
+/** Pair the persisted id with the focused session's exact owner. */
+function makeScope(storedId, owner, connectionId, profile) {
+  const stored = storedId || ''
+  const ambientConnection = connectionId || ''
+  const ambientProfile = profile || ''
+  const ownerConnectionId = owner && typeof owner.connectionId === 'string' ? owner.connectionId : ''
+  const ownerProfile = owner && typeof owner.profile === 'string' ? owner.profile : ''
+  return {
+    storedId: stored,
+    connectionId: ambientConnection,
+    profile: ambientProfile,
+    ownerConnectionId,
+    ownerProfile,
+    exact: !!(stored && ownerConnectionId && ownerProfile &&
+      ownerConnectionId === ambientConnection && ownerProfile === ambientProfile)
+  }
+}
+
+function identityKey(scope) {
+  return [...QUERY_KEY, scope.connectionId, scope.profile, scope.ownerConnectionId, scope.ownerProfile, scope.storedId]
+}
+
+function readScope() {
+  const read = name => {
     try {
-      return await rest('/skills?session_id=' + encodeURIComponent(sid))
+      const a = host.state && host.state[name]
+      return a && typeof a.get === 'function' ? a.get() : undefined
     } catch (e) {
-      /* backend not enabled / older gateway — degrade, never fail the chip */
+      return undefined
     }
   }
+  return makeScope(read('focusedStoredSessionId'), read('focusedSessionOwner'), read('connectionId'), read('profile'))
+}
+
+/**
+ * Session-scoped REST is only valid for the persisted id paired with the
+ * focused session's exact owner, and ctx.rest has no connection/profile
+ * override. Anything else is reported as unavailable — never as 0.
+ */
+async function fetchSkills(scope) {
+  if (!scope.storedId) return unavailablePayload('', 'pending')
+  if (!scope.exact) return unavailablePayload(scope.storedId, 'scope')
+  if (!rest) return unavailablePayload(scope.storedId, 'backend')
   try {
-    return await fromDisplayTranscript(sid)
+    const data = await rest('/skills?session_id=' + encodeURIComponent(scope.storedId))
+    if (!data || typeof data !== 'object' || typeof data.count !== 'number' || !Array.isArray(data.skills)) {
+      return unavailablePayload(scope.storedId, 'response')
+    }
+    return { ...data, unavailable: false }
   } catch (e) {
-    return emptyPayload(sid, true)
+    /* backend not enabled / older gateway — say unavailable, never zero */
+    return unavailablePayload(scope.storedId, 'request')
   }
 }
 
-function useSessionId() {
-  const runtimeId = useValue(host.state.focusedSessionId)
-  const storedId = useValue(host.state.focusedStoredSessionId)
-  return runtimeId || storedId || ''
+function useFocusScope() {
+  return makeScope(
+    useValue(host.state.focusedStoredSessionId),
+    useValue(host.state.focusedSessionOwner),
+    useValue(host.state.connectionId),
+    useValue(host.state.profile)
+  )
 }
 
 function useSkills() {
-  const sid = useSessionId()
+  const scope = useFocusScope()
   return useQuery({
-    queryKey: [...QUERY_KEY, sid],
-    queryFn: () => fetchSkills(sid),
-    enabled: !!sid,
+    queryKey: identityKey(scope),
+    queryFn: () => fetchSkills(scope),
     refetchInterval: REFRESH_MS,
     refetchOnWindowFocus: true,
     staleTime: 1500,
@@ -247,6 +252,31 @@ const DOT = full => ({
   opacity: full ? 1 : 0.8
 })
 
+function unavailableText(data) {
+  switch (data && data.reason) {
+    case 'pending':
+      return 'This conversation has not been saved yet. Loaded skills will appear once it is.'
+    case 'scope':
+      return 'This conversation belongs to a different connection or profile, so its loaded skills cannot be read here.'
+    case 'backend':
+      return 'The loaded-skills backend is unavailable in this profile.'
+    case 'response':
+      return 'The backend returned an unexpected response for this conversation.'
+    default:
+      return 'Could not read loaded skills for this conversation.'
+  }
+}
+
+function UnavailableBody({ data }) {
+  return jsxs('div', {
+    style: { padding: '10px 12px 12px', fontSize: 11.5, lineHeight: 1.5, opacity: 0.85 },
+    children: [
+      jsx('div', { key: 'h', style: { fontWeight: 600, marginBottom: 2 }, children: 'Skills unavailable' }),
+      jsx('div', { key: 'b', style: { opacity: 0.8 }, children: unavailableText(data) })
+    ]
+  })
+}
+
 function SkillRow({ skill }) {
   const full = skill.state === 'full'
   return jsxs('div', {
@@ -331,7 +361,10 @@ function RefreshButton({ onDone }) {
 function ChipDetail() {
   const { data, isError, isLoading } = useSkills()
   if (!data) {
-    return jsx('span', { style: { opacity: 0.6 }, children: isLoading ? '…' : isError ? '?' : '0 loaded' })
+    return jsx('span', { style: { opacity: 0.6 }, children: isLoading ? '…' : isError ? '?' : '—' })
+  }
+  if (data.unavailable) {
+    return jsx('span', { style: { opacity: 0.6 }, title: unavailableText(data), children: '—' })
   }
   const pruned = Array.isArray(data.pruned) ? data.pruned.length : 0
   const kids = [
@@ -373,6 +406,8 @@ function SkillsPanel({ onClose }) {
     body.push(jsx('div', { key: 'load', style: { padding: '8px 12px', fontSize: 11, opacity: 0.7 }, children: 'Reading transcript…' }))
   } else if (isError) {
     body.push(jsx('div', { key: 'err', style: { padding: '8px 12px', fontSize: 11, opacity: 0.8 }, children: 'Could not read loaded skills.' }))
+  } else if (!data || data.unavailable) {
+    body.push(jsx(UnavailableBody, { key: 'unavailable', data }))
   } else if (!skills.length) {
     body.push(
       jsxs('div', { key: 'empty', style: { padding: '10px 12px 12px', fontSize: 11.5, lineHeight: 1.5, opacity: 0.85 }, children: [
@@ -395,11 +430,11 @@ function SkillsPanel({ onClose }) {
     }
   }
 
-  const footerNote = data && data.degraded
-    ? 'Backend off — display transcript only'
-    : data
-      ? 'from this conversation’s transcript'
-      : ''
+  const footerNote = !data
+    ? ''
+    : data.unavailable
+      ? 'not counted — ' + (data.reason === 'pending' ? 'not saved yet' : 'identity unresolved')
+      : 'from this conversation’s transcript'
 
   return jsxs('div', {
     style: { display: 'flex', width: 340, flexDirection: 'column', fontSize: 12 },
@@ -411,7 +446,7 @@ function SkillsPanel({ onClose }) {
         children: [
           jsx('span', { key: 't', style: { fontSize: 12, fontWeight: 650 }, children: 'Loaded skills' }),
           jsxs('span', { key: 'r', style: { display: 'inline-flex', alignItems: 'center', gap: 7 }, children: [
-            jsx('span', { key: 'c', style: { fontSize: 11, opacity: 0.75, fontVariantNumeric: 'tabular-nums' }, children: (data ? data.count : 0) + ' in context' }),
+            jsx('span', { key: 'c', style: { fontSize: 11, opacity: 0.75, fontVariantNumeric: 'tabular-nums' }, children: (data && !data.unavailable && typeof data.count === 'number' ? data.count : '—') + ' in context' }),
             jsx(RefreshButton, { key: 'b' })
           ] })
         ]
@@ -610,6 +645,8 @@ function SkillsPane() {
   }, [loaded])
   const full = loaded.filter(s => s.state === 'full').length
   const pruned = loaded.filter(s => s.state === 'pruned').length
+  const loadedUnavailable = !!(loadedQuery.data && loadedQuery.data.unavailable)
+  const loadedReady = !!loadedQuery.data && !loadedUnavailable
 
   const available = availableQuery.data && Array.isArray(availableQuery.data.skills) ? availableQuery.data.skills : []
   const q = filter.trim().toLowerCase()
@@ -643,7 +680,9 @@ function SkillsPane() {
   } else if (isError) {
     body.push(jsx('div', { key: 'err', style: { padding: '8px 12px', fontSize: 11.5 }, children: view === 'loaded' ? 'Could not read loaded skills.' : 'Could not read the skills list.' }))
   } else if (view === 'loaded') {
-    if (!shownLoaded.length) {
+    if (loadedUnavailable) {
+      body.push(jsx(UnavailableBody, { key: 'unavailable', data: loadedQuery.data }))
+    } else if (!shownLoaded.length) {
       body.push(jsx('div', { key: 'empty', style: { padding: '8px 12px', fontSize: 11.5, color: 'var(--ui-text-quaternary)' }, children: loaded.length ? 'No skill matches that filter.' : 'No skills have been read into this conversation.' }))
     } else {
       for (const s of shownLoaded) body.push(jsx(SkillRow, { skill: s }, 'l-' + s.name))
@@ -665,14 +704,16 @@ function SkillsPane() {
 
   const headCount =
     view === 'loaded'
-      ? full + ' in context · ' + pruned + ' pruned'
-      : available.length + ' available · ' + full + ' loaded'
+      ? loadedReady ? full + ' in context · ' + pruned + ' pruned' : '— in context · — pruned'
+      : available.length + ' available · ' + (loadedReady ? full + ' loaded' : '— loaded')
 
   const footNote =
     view === 'loaded'
-      ? loadedQuery.data && loadedQuery.data.degraded
-        ? 'Backend off — display transcript'
-        : 'live from the transcript'
+      ? loadedUnavailable
+        ? 'skills unavailable for this conversation'
+        : loadedReady
+          ? 'live from the transcript'
+          : 'reading transcript…'
       : 'click a skill to put /name in the composer'
 
   return jsxs('div', {
@@ -736,13 +777,14 @@ function SkillsPage() {
 
   const full = skills.filter(s => s.state === 'full').length
   const pruned = skills.filter(s => s.state === 'pruned').length
+  const unavailable = !!(data && data.unavailable)
 
   return jsxs('div', {
     style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, padding: '18px 22px', gap: 12 },
     children: [
       jsxs('div', { key: 'head', style: { display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }, children: [
         jsx('div', { key: 't', style: { fontSize: 16, fontWeight: 650 }, children: 'Loaded skills' }),
-        jsx('div', { key: 's', style: { fontSize: 11.5, color: 'var(--ui-text-quaternary)' }, children: full + ' in context · ' + pruned + ' pruned · ' + (data ? REFRESH_MS / 1000 : '–') + 's refresh' })
+        jsx('div', { key: 's', style: { fontSize: 11.5, color: 'var(--ui-text-quaternary)' }, children: (unavailable || !data ? '— in context · — pruned' : full + ' in context · ' + pruned + ' pruned') + ' · ' + (data ? REFRESH_MS / 1000 : '–') + 's refresh' })
       ] }),
       jsxs('div', { key: 'bar', style: { display: 'flex', alignItems: 'center', gap: 8 }, children: [
         jsx('input', {
@@ -763,7 +805,7 @@ function SkillsPage() {
           }
         }),
         jsx(RefreshButton, { key: 'r' }),
-        jsx('span', { key: 'n', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' }, children: shown.length + ' shown' })
+        jsx('span', { key: 'n', style: { fontSize: 11, color: 'var(--ui-text-quaternary)' }, children: (unavailable || !data ? '—' : shown.length) + ' shown' })
       ] }),
       jsxs('div', {
         key: 'list',
@@ -773,16 +815,18 @@ function SkillsPage() {
             ? jsx('div', { style: { padding: '10px 12px', fontSize: 12, opacity: 0.7 }, children: 'Reading transcript…' }, 'load')
             : isError
               ? jsx('div', { style: { padding: '10px 12px', fontSize: 12 }, children: 'Could not read loaded skills.' }, 'err')
-              : shown.length
-                ? shown.map(s => jsx(SkillRow, { skill: s }, s.name))
-                : jsx('div', { style: { padding: '10px 12px', fontSize: 12, color: 'var(--ui-text-quaternary)' }, children: skills.length ? 'No skill matches that filter.' : 'No skills have been read into this conversation.' }, 'empty')
+              : unavailable
+                ? jsx(UnavailableBody, { data }, 'unavailable')
+                : shown.length
+                  ? shown.map(s => jsx(SkillRow, { skill: s }, s.name))
+                  : jsx('div', { style: { padding: '10px 12px', fontSize: 12, color: 'var(--ui-text-quaternary)' }, children: skills.length ? 'No skill matches that filter.' : 'No skills have been read into this conversation.' }, 'empty')
         ]
       }),
       jsx('div', {
         key: 'foot',
         style: { fontSize: 10.5, color: 'var(--ui-text-quaternary)' },
-        children: data && data.degraded
-          ? 'Backend unavailable for this profile — showing the display transcript, which cannot see pruned tool bodies.'
+        children: unavailable
+          ? unavailableText(data)
           : 'A skill counts as loaded while its body is still in the transcript; compression replaces it with a pruned marker and it is ghosted here.'
       })
     ]
@@ -797,8 +841,10 @@ function scheduleRefresh() {
   if (pendingTimer) return
   pendingTimer = setTimeout(() => {
     pendingTimer = null
+    const scope = readScope()
+    if (!scope.exact) return
     try {
-      queryClient.invalidateQueries({ queryKey: QUERY_KEY })
+      queryClient.invalidateQueries({ queryKey: identityKey(scope) })
     } catch (e) {
       /* query client unavailable — the 5s interval still runs */
     }
@@ -808,6 +854,13 @@ function scheduleRefresh() {
 function onGatewayEvent(event) {
   if (!event || typeof event.type !== 'string') return
   if (!/tool|message|session\.|context|skill|compact|turn|usage/i.test(event.type)) return
+  const scope = readScope()
+  if (!scope.exact) return
+  const payload = event.payload || {}
+  const sid = event.session_id || payload.session_id
+  if (sid && sid !== scope.storedId) return
+  if (event.connectionId && event.connectionId !== scope.ownerConnectionId) return
+  if (event.profile && event.profile !== scope.ownerProfile) return
   scheduleRefresh()
 }
 
